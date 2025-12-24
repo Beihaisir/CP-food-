@@ -1,11 +1,9 @@
 # -*- coding: utf-8 -*-
 import re
 import json
-import math
 import tempfile
 from pathlib import Path
-from datetime import date  # ✅ 修复：类型注解用到 date
-
+from datetime import date
 from typing import Dict, List, Tuple, Optional
 
 import numpy as np
@@ -16,23 +14,25 @@ import plotly.graph_objects as go
 
 st.set_page_config(page_title="餐饮日销售&菜品结构分析", layout="wide")
 
+
 # -----------------------------
 # Utilities
 # -----------------------------
 def _norm_col(s: str) -> str:
     return str(s).strip().replace("\u3000", " ")
 
-def _to_numeric(s):
+
+def _to_dt_series(s: pd.Series) -> pd.Series:
+    return pd.to_datetime(s, errors="coerce")
+
+
+def _to_num_series(s: pd.Series) -> pd.Series:
     return pd.to_numeric(s, errors="coerce")
 
-def _safe_dt(x):
-    return pd.to_datetime(x, errors="coerce")
 
-def _contains_any(text: str, keys: List[str]) -> bool:
-    if text is None or (isinstance(text, float) and np.isnan(text)):
-        return False
-    t = str(text)
-    return any(k in t for k in keys)
+def _is_nan(x) -> bool:
+    return x is None or (isinstance(x, float) and np.isnan(x))
+
 
 # -----------------------------
 # Default configurable rules
@@ -74,25 +74,53 @@ DEFAULT_SPEC_RULES = {
     }
 }
 
+# 用于“自动表头识别”的关键字段
+SALES_KEYS = {"日期", "含税销售额", "去税销售额", "客流量", "客单", "门店名称", "门店代码", "销售数量"}
+ITEMS_KEYS = {"创建时间", "菜品名称", "菜品数量", "POS销售单号", "单据类型", "规格名称", "优惠后小计价格", "小计价格"}
+
+
 # -----------------------------
-# Loading data (cached)
+# Smart Excel loader (auto header row)
 # -----------------------------
 @st.cache_data(show_spinner=False)
-def load_excel(path: str, sheet_name: Optional[str] = None) -> pd.DataFrame:
+def load_excel_smart(path: str, sheet_name: Optional[str] = None) -> pd.DataFrame:
+    """
+    智能读取 Excel：自动识别真正表头行（解决：导出文件前几行是标题/导出信息/空行等）
+    """
     try:
-        df = pd.read_excel(path, sheet_name=sheet_name)
+        preview = pd.read_excel(path, sheet_name=sheet_name, header=None, nrows=40)
+        preview = preview.replace({np.nan: ""})
+
+        best_row = None
+        best_score = -1
+
+        for i in range(len(preview)):
+            row_vals = set(str(x).strip() for x in preview.iloc[i].tolist() if str(x).strip() != "")
+            score = len(row_vals & SALES_KEYS) + len(row_vals & ITEMS_KEYS)
+            if score > best_score:
+                best_score = score
+                best_row = i
+
+        # 至少命中 2 个关键字段才认为找到了表头
+        if best_row is not None and best_score >= 2:
+            df = pd.read_excel(path, sheet_name=sheet_name, header=best_row)
+        else:
+            df = pd.read_excel(path, sheet_name=sheet_name)
+
         if isinstance(df, dict):
             df = list(df.values())[0]
+
         df.columns = [_norm_col(c) for c in df.columns]
         return df
     except Exception as e:
         raise RuntimeError(f"读取失败：{path}\n{e}")
 
+
 # -----------------------------
-# Feature engineering
+# Rules: channel / tags / spec
 # -----------------------------
 def detect_channel(dish_name: str, channel_rules: Dict[str, List[str]]) -> str:
-    if dish_name is None or (isinstance(dish_name, float) and np.isnan(dish_name)):
+    if _is_nan(dish_name):
         return "未知"
     name = str(dish_name)
     for ch, keys in channel_rules.items():
@@ -100,11 +128,12 @@ def detect_channel(dish_name: str, channel_rules: Dict[str, List[str]]) -> str:
             return ch
     return "非抖音/未知"
 
+
 def extract_tags(dish_name: str, tag_rules: Dict[str, List[str]]) -> List[str]:
     """
-    多标签：一个菜可以命中多个类；计数时 explode 后每个类各计一次。
+    多标签：一个菜可命中多个类；计数时 explode 后每个类各计一次（不分摊、不稀释）。
     """
-    if dish_name is None or (isinstance(dish_name, float) and np.isnan(dish_name)):
+    if _is_nan(dish_name):
         return ["未分类"]
     name = str(dish_name)
     tags = []
@@ -113,14 +142,12 @@ def extract_tags(dish_name: str, tag_rules: Dict[str, List[str]]) -> List[str]:
             tags.append(tag)
     return tags if tags else ["未分类"]
 
+
 def normalize_spec(spec_name: str, spec_rules: Dict[str, Dict[str, List[str]]]) -> Tuple[str, str]:
     """
     规格 -> base/size 两维
     """
-    if spec_name is None or (isinstance(spec_name, float) and np.isnan(spec_name)):
-        spec = ""
-    else:
-        spec = str(spec_name)
+    spec = "" if _is_nan(spec_name) else str(spec_name)
 
     base_map = spec_rules.get("base", {})
     size_map = spec_rules.get("size", {})
@@ -139,8 +166,9 @@ def normalize_spec(spec_name: str, spec_rules: Dict[str, Dict[str, List[str]]]) 
 
     return base, size
 
+
 # -----------------------------
-# Pre-aggregation (large data friendly)
+# Prepare: items (large-friendly)
 # -----------------------------
 @st.cache_data(show_spinner=False)
 def prepare_items(
@@ -149,18 +177,20 @@ def prepare_items(
     tag_rules: Dict[str, List[str]],
     spec_rules: Dict[str, Dict[str, List[str]]],
     include_refund: bool,
-    only_normal_status: bool
+    only_normal_status: bool,
+    time_col_hint: Optional[str] = None,
+    order_col_hint: Optional[str] = None,
 ) -> Dict[str, pd.DataFrame]:
     df = items.copy()
     df.columns = [_norm_col(c) for c in df.columns]
 
-    # Column mapping (best-effort)
-    col_time = "创建时间" if "创建时间" in df.columns else None
+    # Best-effort column mapping (允许 hint 覆盖)
+    col_time = time_col_hint if (time_col_hint and time_col_hint in df.columns) else ("创建时间" if "创建时间" in df.columns else None)
     col_dish = "菜品名称" if "菜品名称" in df.columns else None
-    col_qty  = "菜品数量" if "菜品数量" in df.columns else None
+    col_qty = "菜品数量" if "菜品数量" in df.columns else None
     col_spec = "规格名称" if "规格名称" in df.columns else None
     col_status = "菜品状态" if "菜品状态" in df.columns else None
-    col_order = "POS销售单号" if "POS销售单号" in df.columns else None
+    col_order = order_col_hint if (order_col_hint and order_col_hint in df.columns) else ("POS销售单号" if "POS销售单号" in df.columns else None)
     col_doc_type = "单据类型" if "单据类型" in df.columns else None
     col_refund = "POS退款单号" if "POS退款单号" in df.columns else None
 
@@ -171,17 +201,21 @@ def prepare_items(
             col_amt = c
             break
 
-    if col_time is None or col_dish is None or col_qty is None or col_order is None or col_amt is None:
-        raise RuntimeError("菜品明细缺少关键字段（创建时间/菜品名称/菜品数量/POS销售单号/金额列）。")
+    missing = []
+    for k, v in [("创建时间", col_time), ("菜品名称", col_dish), ("菜品数量", col_qty), ("POS销售单号", col_order), ("金额列(优惠后小计价格/小计价格)", col_amt)]:
+        if v is None:
+            missing.append(k)
+    if missing:
+        raise RuntimeError(f"菜品明细缺少关键字段：{missing}\n当前列名：{list(df.columns)}")
 
-    df[col_time] = pd.to_datetime(df[col_time], errors="coerce")
+    df[col_time] = _to_dt_series(df[col_time])
     df = df.dropna(subset=[col_time]).copy()
 
     df["date"] = df[col_time].dt.date
-    df["qty"] = pd.to_numeric(df[col_qty], errors="coerce").fillna(0.0)
-    df["amount"] = pd.to_numeric(df[col_amt], errors="coerce").fillna(0.0)
+    df["qty"] = _to_num_series(df[col_qty]).fillna(0.0)
+    df["amount"] = _to_num_series(df[col_amt]).fillna(0.0)
 
-    # Refund handling (best-effort)
+    # Refund handling
     if not include_refund:
         refund_mask = pd.Series(False, index=df.index)
         if col_doc_type is not None:
@@ -196,7 +230,6 @@ def prepare_items(
 
     # Enrich: channel, spec, tags
     df["channel"] = df[col_dish].apply(lambda x: detect_channel(x, channel_rules))
-
     if col_spec is not None:
         df["spec_base"], df["spec_size"] = zip(*df[col_spec].apply(lambda x: normalize_spec(x, spec_rules)))
     else:
@@ -238,7 +271,7 @@ def prepare_items(
                          orders=(col_order, "nunique")))
 
     return {
-        "items_raw": df,          # filtered raw
+        "items_raw": df,
         "order": order,
         "daily": daily,
         "daily_channel": daily_ch,
@@ -246,27 +279,59 @@ def prepare_items(
         "daily_spec": daily_spec
     }
 
+
+# -----------------------------
+# Prepare: sales (robust date column)
+# -----------------------------
 @st.cache_data(show_spinner=False)
-def prepare_sales(sales: pd.DataFrame) -> pd.DataFrame:
+def prepare_sales(sales: pd.DataFrame, date_col_hint: Optional[str] = None) -> pd.DataFrame:
     df = sales.copy()
     df.columns = [_norm_col(c) for c in df.columns]
 
-    date_col = "日期" if "日期" in df.columns else None
-    if date_col is None:
+    # If user specified date column, use it
+    if date_col_hint and date_col_hint in df.columns:
+        date_col = date_col_hint
+    else:
+        # Candidate columns by name keywords
+        keys = ["日期", "日 期", "营业日期", "交易日期", "统计日期", "业务日期", "biz_date", "business_date", "order_date", "date"]
+        candidates = []
         for c in df.columns:
-            if "日期" in c or "date" in c.lower():
-                date_col = c
-                break
-    if date_col is None:
-        raise RuntimeError("日销售表缺少日期字段（日期）。")
+            cl = str(c).lower()
+            if any(k.lower() in cl for k in keys):
+                candidates.append(c)
 
-    df[date_col] = pd.to_datetime(df[date_col], errors="coerce")
+        if not candidates:
+            candidates = list(df.columns)
+
+        # Content-based scoring: parse success rate
+        best_col, best_score, best_parsed = None, -1.0, None
+        for c in candidates:
+            s = _to_dt_series(df[c])
+            score = s.notna().mean()
+            if score > 0:
+                uniq = s.dropna().dt.date.nunique()
+                if uniq > 1:
+                    score += 0.05
+            if score > best_score:
+                best_score, best_col, best_parsed = score, c, s
+
+        if best_col is None or best_score < 0.30:
+            raise RuntimeError(
+                "日销售表无法识别日期列。\n"
+                f"已读取列名：{list(df.columns)}\n"
+                "请在左侧选择正确的日期列名。"
+            )
+        date_col = best_col
+        df[date_col] = best_parsed
+
+    df[date_col] = _to_dt_series(df[date_col])
     df = df.dropna(subset=[date_col]).copy()
     df["date"] = df[date_col].dt.date
 
+    # Numeric best-effort
     for c in ["含税销售额", "去税销售额", "销售数量", "客流量", "客单"]:
         if c in df.columns:
-            df[c] = pd.to_numeric(df[c], errors="coerce")
+            df[c] = _to_num_series(df[c])
 
     iso = df[date_col].dt.isocalendar()
     df["weekday"] = df[date_col].dt.weekday
@@ -275,6 +340,7 @@ def prepare_sales(sales: pd.DataFrame) -> pd.DataFrame:
     df["iso_week"] = iso["week"].astype("Int64")
     df["year_month"] = df[date_col].dt.to_period("M").astype(str)
     return df
+
 
 # -----------------------------
 # Analytics helpers
@@ -287,6 +353,7 @@ def overlap_range(a: pd.Series, b: pd.Series) -> Tuple[Optional[pd.Timestamp], O
         return None, None
     return lo, hi
 
+
 def add_rolling_anomaly(df: pd.DataFrame, value_col: str, window: int = 28) -> pd.DataFrame:
     d = df.sort_values("date").copy()
     x = d[value_col].astype(float)
@@ -297,14 +364,15 @@ def add_rolling_anomaly(df: pd.DataFrame, value_col: str, window: int = 28) -> p
     d["is_anomaly"] = d["zscore"].abs() >= 2.0
     return d
 
+
 def decompose_change(daily_items: pd.DataFrame) -> pd.DataFrame:
     d = daily_items.sort_values("date").copy()
     d["qty_per_order"] = d["items_qty"] / d["items_orders"].replace(0, np.nan)
     d["price_per_item"] = d["items_amount"] / d["items_qty"].replace(0, np.nan)
 
     roll_orders = d["items_orders"].shift(1).rolling(7, min_periods=3).mean()
-    roll_qpo    = d["qty_per_order"].shift(1).rolling(7, min_periods=3).mean()
-    roll_ppi    = d["price_per_item"].shift(1).rolling(7, min_periods=3).mean()
+    roll_qpo = d["qty_per_order"].shift(1).rolling(7, min_periods=3).mean()
+    roll_ppi = d["price_per_item"].shift(1).rolling(7, min_periods=3).mean()
 
     d["base_orders"] = roll_orders
     d["base_qpo"] = roll_qpo
@@ -313,9 +381,10 @@ def decompose_change(daily_items: pd.DataFrame) -> pd.DataFrame:
     d["chg_vs_base"] = (d["items_amount"] - d["base_amount"])
     return d
 
+
 def week_shape(df_sales: pd.DataFrame, value_col: str = "含税销售额") -> pd.DataFrame:
     d = df_sales.copy()
-    d = d[d["weekday"].between(0, 4)].copy()  # Mon-Fri
+    d = d[d["weekday"].between(0, 4)].copy()
     wk = (d.groupby(["iso_year", "iso_week", "weekday"], as_index=False)
             .agg(value=(value_col, "sum")))
     wk["week_total"] = wk.groupby(["iso_year", "iso_week"])["value"].transform("sum")
@@ -323,18 +392,6 @@ def week_shape(df_sales: pd.DataFrame, value_col: str = "含税销售额") -> pd
     wk["weekday_name"] = wk["weekday"].map({0: "周一", 1: "周二", 2: "周三", 3: "周四", 4: "周五"})
     return wk
 
-def top_contributors(
-    daily_dim: pd.DataFrame,
-    start: date,
-    end: date,
-    dim_col: str,
-    amount_col: str = "amount",
-    top_n: int = 15
-) -> pd.DataFrame:
-    d = daily_dim.copy()
-    d = d[(d["date"] >= start) & (d["date"] <= end)].copy()
-    g = d.groupby(dim_col, as_index=False)[amount_col].sum().sort_values(amount_col, ascending=False).head(top_n)
-    return g
 
 def delta_contribution(
     daily_dim: pd.DataFrame,
@@ -357,13 +414,15 @@ def delta_contribution(
     out2 = pd.concat([worst, best]).reset_index().rename(columns={dim_col: "维度"})
     return out2.sort_values("delta")
 
+
 # -----------------------------
 # Sidebar: upload & rules
 # -----------------------------
-st.sidebar.header("数据与口径（方式B：上传文件）")
+st.sidebar.header("数据与口径（上传文件）")
 
 sales_up = st.sidebar.file_uploader("上传日销售报表（.xls/.xlsx）", type=["xls", "xlsx"])
 items_up = st.sidebar.file_uploader("上传订单菜品报告（.xls/.xlsx）", type=["xls", "xlsx"])
+
 
 def _save_upload(uploaded_file) -> Optional[str]:
     if uploaded_file is None:
@@ -374,6 +433,7 @@ def _save_upload(uploaded_file) -> Optional[str]:
     tmp.close()
     return tmp.name
 
+
 sales_path = _save_upload(sales_up)
 items_path = _save_upload(items_up)
 
@@ -382,6 +442,15 @@ only_normal_status = st.sidebar.checkbox("仅统计“正常”菜品状态（�
 
 st.sidebar.divider()
 st.sidebar.subheader("规则配置（可直接改JSON）")
+
+
+def parse_json(text: str, fallback):
+    try:
+        return json.loads(text)
+    except Exception:
+        st.sidebar.error("JSON解析失败：将使用默认规则。请检查逗号/引号是否正确。")
+        return fallback
+
 
 channel_rules_text = st.sidebar.text_area(
     "渠道识别规则 channel_rules（菜品名称包含关键词即命中）",
@@ -399,32 +468,60 @@ spec_rules_text = st.sidebar.text_area(
     height=240
 )
 
-def parse_json(text: str, fallback):
-    try:
-        return json.loads(text)
-    except Exception:
-        st.sidebar.error("JSON解析失败：将使用默认规则。请检查逗号/引号是否正确。")
-        return fallback
-
 channel_rules = parse_json(channel_rules_text, DEFAULT_CHANNEL_RULES)
 tag_rules = parse_json(tag_rules_text, DEFAULT_TAG_RULES)
 spec_rules = parse_json(spec_rules_text, DEFAULT_SPEC_RULES)
 
 # Require uploads
+st.title("餐饮经营分析（日销售 × 订单菜品明细）")
 if sales_path is None or items_path is None:
-    st.title("餐饮经营分析（日销售 × 订单菜品明细）")
     st.info("请在左侧先上传两个文件（日销售报表、订单菜品报告）后开始分析。")
     st.stop()
 
 # -----------------------------
-# Load data
+# Load data (smart header)
 # -----------------------------
-with st.spinner("读取数据..."):
-    sales_raw = load_excel(sales_path)
-    items_raw = load_excel(items_path)
+with st.spinner("读取数据（智能识别表头）..."):
+    sales_raw = load_excel_smart(sales_path)
+    items_raw = load_excel_smart(items_path)
 
-sales = prepare_sales(sales_raw)
-items_pack = prepare_items(items_raw, channel_rules, tag_rules, spec_rules, include_refund, only_normal_status)
+# Sidebar: allow manual mapping for date/time/order fields
+st.sidebar.divider()
+st.sidebar.subheader("字段映射（识别不准时手动选）")
+
+sales_date_col = st.sidebar.selectbox(
+    "日销售：日期列",
+    options=["(自动识别)"] + list(sales_raw.columns),
+    index=0
+)
+sales_date_hint = None if sales_date_col == "(自动识别)" else sales_date_col
+
+items_time_col = st.sidebar.selectbox(
+    "菜品明细：创建时间列",
+    options=["(自动识别)"] + list(items_raw.columns),
+    index=0
+)
+items_time_hint = None if items_time_col == "(自动识别)" else items_time_col
+
+items_order_col = st.sidebar.selectbox(
+    "菜品明细：POS销售单号列",
+    options=["(自动识别)"] + list(items_raw.columns),
+    index=0
+)
+items_order_hint = None if items_order_col == "(自动识别)" else items_order_col
+
+with st.spinner("清洗与预聚合..."):
+    sales = prepare_sales(sales_raw, date_col_hint=sales_date_hint)
+    items_pack = prepare_items(
+        items_raw,
+        channel_rules=channel_rules,
+        tag_rules=tag_rules,
+        spec_rules=spec_rules,
+        include_refund=include_refund,
+        only_normal_status=only_normal_status,
+        time_col_hint=items_time_hint,
+        order_col_hint=items_order_hint
+    )
 
 items_daily = items_pack["daily"]
 daily_channel = items_pack["daily_channel"]
@@ -434,8 +531,6 @@ daily_spec = items_pack["daily_spec"]
 # -----------------------------
 # Global filters
 # -----------------------------
-st.title("餐饮经营分析（日销售 × 订单菜品明细）")
-
 # Store selector if present
 if "门店名称" in sales.columns:
     stores = ["全部"] + sorted(sales["门店名称"].dropna().astype(str).unique().tolist())
@@ -472,8 +567,15 @@ items_daily_f = items_daily[(items_daily["date"] >= start_date) &
 
 metric = st.selectbox("核心指标（来自日销售表）", ["含税销售额", "客流量", "客单", "销售数量"], index=0)
 if metric not in sales_f.columns:
-    st.warning(f"日销售表缺少字段：{metric}。将回退使用“含税销售额”。")
-    metric = "含税销售额" if "含税销售额" in sales_f.columns else sales_f.select_dtypes(include=[np.number]).columns[0]
+    st.warning(f"日销售表缺少字段：{metric}。将回退使用“含税销售额”或任意数值列。")
+    if "含税销售额" in sales_f.columns:
+        metric = "含税销售额"
+    else:
+        num_cols = sales_f.select_dtypes(include=[np.number]).columns.tolist()
+        if not num_cols:
+            st.error("日销售表没有可用的数值指标列，请检查数据。")
+            st.stop()
+        metric = num_cols[0]
 
 # -----------------------------
 # Tabs (decision-path)
@@ -486,15 +588,25 @@ tab1, tab2, tab3, tab4, tab5 = st.tabs([
     "5 异常日钻取（闭环）"
 ])
 
-# ---------- Tab 1 ----------
+# ---------- Tab 1: Trend & anomaly ----------
 with tab1:
     c1, c2, c3, c4 = st.columns(4)
+
     if "含税销售额" in sales_f.columns:
         c1.metric("含税销售额（选定范围）", f"{float(sales_f['含税销售额'].sum(skipna=True)):,.0f}")
+    else:
+        c1.metric(f"{metric}（选定范围）", f"{float(sales_f[metric].sum(skipna=True)):,.0f}")
+
     if "客流量" in sales_f.columns:
         c2.metric("客流量（选定范围）", f"{float(sales_f['客流量'].sum(skipna=True)):,.0f}")
+    else:
+        c2.metric("客流量（选定范围）", "—")
+
     if "客单" in sales_f.columns:
         c3.metric("平均客单", f"{float(sales_f['客单'].mean(skipna=True)):,.2f}")
+    else:
+        c3.metric("平均客单", "—")
+
     c4.metric("菜品明细汇总金额", f"{float(items_daily_f['items_amount'].sum()) if len(items_daily_f) else 0.0:,.0f}")
 
     left, right = st.columns([2, 1])
@@ -535,7 +647,7 @@ with tab1:
         else:
             st.info("当前日期范围内无法做对齐检查（无交集或明细为空）。")
 
-# ---------- Tab 2 ----------
+# ---------- Tab 2: Decomposition ----------
 with tab2:
     st.subheader("销售变化拆解（订单数 × 每单件数 × 平均成交价/件）")
     if len(items_daily_f) < 5:
@@ -565,7 +677,7 @@ with tab2:
             use_container_width=True
         )
 
-# ---------- Tab 3 ----------
+# ---------- Tab 3: Week rhythm ----------
 with tab3:
     st.subheader("周一~周五：周节奏健康度（形状变化比高低更重要）")
     if metric not in sales_f.columns or len(sales_f) < 10:
@@ -592,7 +704,7 @@ with tab3:
         stab["weekday_name"] = stab["weekday"].map({0: "周一", 1: "周二", 2: "周三", 3: "周四", 4: "周五"})
         st.dataframe(stab.sort_values("cv", ascending=False)[["weekday_name", "mean", "std", "cv"]], use_container_width=True)
 
-# ---------- Tab 4 ----------
+# ---------- Tab 4: Drivers ----------
 with tab4:
     st.subheader("驱动因素：类（多标签计数）/ 规格 / 渠道（抖音套餐）")
     c1, c2 = st.columns(2)
@@ -652,7 +764,7 @@ with tab4:
         else:
             st.info("无类别数据。")
 
-# ---------- Tab 5 ----------
+# ---------- Tab 5: Drilldown ----------
 with tab5:
     st.subheader("异常日钻取：先发现 → 再解释 → 再给动作对象（类/规格/渠道）")
 
